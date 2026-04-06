@@ -29,6 +29,7 @@ use crate::{
         AskRequest, RecipientTellRequest, ReplyRecipientAskRequest, ReplyRecipientTellRequest,
         TellRequest, WithoutRequestTimeout,
     },
+    disposable::DisposableHandle,
 };
 
 use super::id::ActorId;
@@ -671,6 +672,53 @@ where
         )
     }
 
+    /// Sends a delayed message to the actor without waiting for a reply.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use kameo::actor::{Actor, ActorRef, Spawn};
+    /// use tokio::time::Duration;
+    ///
+    /// # #[derive(kameo::Actor)]
+    /// # struct MyActor;
+    /// #
+    /// # struct Msg;
+    /// #
+    /// # impl kameo::message::Message<Msg> for MyActor {
+    /// #     type Reply = ();
+    /// #     async fn handle(&mut self, msg: Msg, ctx: &mut kameo::message::Context<Self, Self::Reply>) -> Self::Reply { }
+    /// # }
+    /// #
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// # let msg = Msg;
+    /// let _ = actor_ref.delayed_tell(msg, Duration::from_millis(200), async move |result|{ assert_eq!(result.is_ok(), true); });
+    /// tokio::time::sleep(Duration::from_secs(1)).await;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// ```
+    #[inline]
+    #[doc(alias = "send_async")]
+    pub async fn delayed_tell<M, F, Fut>(&self, msg: M, delay: Duration, on_result: F) -> DisposableHandle
+    where
+        A: Message<M>,
+        M: Send + 'static,
+        F: FnOnce(Result<(), SendError<M>>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let weak_ref = self.downgrade();
+        let join_handle = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let result = match weak_ref.upgrade() {
+                Some(strong_ref) => strong_ref.tell(msg).await,
+                None => Err(SendError::ActorStopped),
+            };
+            on_result(result).await;
+        });
+        DisposableHandle::new(join_handle)
+    }
+
     /// Links two actors as siblings, ensuring they notify each other if either one dies.
     ///
     /// # Example
@@ -719,6 +767,38 @@ where
                 .sibblings
                 .insert(self.id, Link::Local(self.weak_signal_mailbox()));
         }
+    }
+
+    /// This is a one-way link used to monitor sibling actors; when a sibling actor dies, the current actor will receive a notification. 
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use kameo::Actor;
+    /// # use kameo::actor::Spawn;
+    /// #
+    /// # #[derive(Actor)]
+    /// # struct MyActor;
+    /// #
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// let sibling_ref = MyActor::spawn(MyActor);
+    ///
+    /// actor_ref.watch(&sibling_ref).await;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// ```
+    #[inline]
+    pub async fn watch<B: Actor>(&self, sibling_ref: &ActorRef<B>) {
+        if self.id == sibling_ref.id {
+            return;
+        }
+
+        let mut sibling_links = sibling_ref.links.lock().await;
+
+        sibling_links
+            .sibblings
+            .insert(self.id, Link::Local(self.weak_signal_mailbox()));
     }
 
     /// Blockingly links two actors as siblings, ensuring they notify each other if either one dies.
@@ -777,6 +857,46 @@ where
                 .sibblings
                 .insert(self.id, Link::Local(self.weak_signal_mailbox()));
         }
+    }
+
+    /// This is a one-way link used to monitor sibling actors in a synchronous context; when a sibling actor dies, the current actor will receive a notification. 
+    ///
+    /// This method is intended for use cases where you need to watch actors in synchronous code.
+    /// For async contexts, [`watch`] is preferred.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::thread;
+    ///
+    /// # use kameo::Actor;
+    /// # use kameo::actor::Spawn;
+    /// #
+    /// # #[derive(Actor)]
+    /// # struct MyActor;
+    /// #
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// let sibling_ref = MyActor::spawn(MyActor);
+    ///
+    /// thread::spawn(move || {
+    ///     actor_ref.blocking_watch(&sibling_ref);
+    /// });
+    /// # });
+    /// ```
+    ///
+    /// [`watch`]: ActorRef::watch
+    #[inline]
+    pub fn blocking_watch<B: Actor>(&self, sibling_ref: &ActorRef<B>) {
+        if self.id == sibling_ref.id {
+            return;
+        }
+
+        let mut sibling_links = sibling_ref.links.blocking_lock();
+
+        sibling_links
+            .sibblings
+            .insert(self.id, Link::Local(self.weak_signal_mailbox()));
     }
 
     pub(crate) async fn link_child(
@@ -855,6 +975,53 @@ where
             .await
     }
 
+    /// This is a one-way link used to monitor remote sibling actors; when a remote sibling actor dies, the current actor will receive a notification. 
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use kameo::Actor;
+    /// # use kameo::actor::{RemoteActorRef, Spawn};
+    /// #
+    /// # #[derive(Actor, kameo::RemoteActor)]
+    /// # struct MyActor;
+    /// #
+    /// # #[derive(Actor, kameo::RemoteActor)]
+    /// # struct OtherActor;
+    /// #
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// let sibling_ref = RemoteActorRef::<OtherActor>::lookup("other_actor").await?.unwrap();
+    ///
+    /// actor_ref.watch_remote(&sibling_ref).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// ```
+    #[cfg(feature = "remote")]
+    pub async fn watch_remote<B>(
+        &self,
+        sibling_ref: &RemoteActorRef<B>,
+    ) -> Result<(), error::RemoteSendError<error::Infallible>>
+    where
+        A: remote::RemoteActor,
+        B: Actor + remote::RemoteActor,
+    {
+        if self.id == sibling_ref.id {
+            return Ok(());
+        }
+
+        remote::REMOTE_REGISTRY
+            .lock()
+            .await
+            .entry(self.id)
+            .or_insert_with(|| remote::RemoteRegistryActorRef::new(self.clone(), None));
+
+        remote::ActorSwarm::get()
+            .ok_or(error::RemoteSendError::SwarmNotBootstrapped)?
+            .link::<A, B>(self.id, sibling_ref.id)
+            .await
+    }
+
     /// Unlinks two previously linked sibling actors.
     ///
     /// # Example
@@ -895,9 +1062,38 @@ where
         }
     }
 
+    /// Unwatchs the previously watched actor.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use kameo::Actor;
+    /// # use kameo::actor::Spawn;
+    /// #
+    /// # #[derive(Actor)]
+    /// # struct MyActor;
+    /// #
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// let sibling_ref = MyActor::spawn(MyActor);
+    ///
+    /// actor_ref.watch(&sibling_ref).await;
+    /// actor_ref.unwatch(&sibling_ref).await;
+    /// # });
+    /// ```
+    #[inline]
+    pub async fn unwatch<B: Actor>(&self, sibling_ref: &ActorRef<B>) {
+        if self.id == sibling_ref.id {
+            return;
+        }
+
+        let mut sibling_links = sibling_ref.links.lock().await;
+        sibling_links.sibblings.remove(&self.id);
+    }
+
     /// Blockingly unlinks two previously linked sibling actors.
     ///
-    /// This method is intended for use cases where you need to link actors in synchronous code.
+    /// This method is intended for use cases where you need to unlink actors in synchronous code.
     /// For async contexts, [`unlink`] is preferred.
     ///
     ///
@@ -945,6 +1141,45 @@ where
         }
     }
 
+    /// Blockingly unwatches the previously linked actor.
+    ///
+    /// This method is intended for use cases where you need to unwatch actors in synchronous code.
+    /// For async contexts, [`unwatch`] is preferred.
+    ///
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::thread;
+    /// #
+    /// # use kameo::Actor;
+    /// # use kameo::actor::Spawn;
+    /// #
+    /// # #[derive(Actor)]
+    /// # struct MyActor;
+    /// #
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// let sibling_ref = MyActor::spawn(MyActor);
+    ///
+    /// thread::spawn(move || {
+    ///     actor_ref.blocking_watch(&sibling_ref);
+    ///     actor_ref.blocking_unwatch(&sibling_ref);
+    /// });
+    /// # });
+    /// ```
+    ///
+    /// [`unwatch`]: ActorRef::unwatch
+    #[inline]
+    pub fn blocking_unwatch<B: Actor>(&self, sibling_ref: &ActorRef<B>) {
+        if self.id == sibling_ref.id {
+            return;
+        }
+
+        let mut sibling_links = sibling_ref.links.blocking_lock();
+        sibling_links.sibblings.remove(&self.id);
+    }
+
     /// Unlinks the local actor with a previously linked remote actor.
     ///
     /// # Example
@@ -981,6 +1216,47 @@ where
         }
 
         self.links.lock().await.sibblings.remove(&sibling_ref.id);
+        remote::ActorSwarm::get()
+            .ok_or(error::RemoteSendError::SwarmNotBootstrapped)?
+            .unlink::<B>(self.id, sibling_ref.id)
+            .await
+    }
+
+    /// Unwatches the local actor with a previously watched remote actor.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use kameo::Actor;
+    /// # use kameo::actor::{RemoteActorRef, Spawn};
+    /// #
+    /// # #[derive(Actor, kameo::RemoteActor)]
+    /// # struct MyActor;
+    /// #
+    /// # #[derive(Actor, kameo::RemoteActor)]
+    /// # struct OtherActor;
+    /// #
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// let sibling_ref = RemoteActorRef::<OtherActor>::lookup("other_actor").await?.unwrap();
+    ///
+    /// actor_ref.unwatch_remote(&sibling_ref).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// ```
+    #[cfg(feature = "remote")]
+    pub async fn unwatch_remote<B>(
+        &self,
+        sibling_ref: &RemoteActorRef<B>,
+    ) -> Result<(), error::RemoteSendError<error::Infallible>>
+    where
+        A: remote::RemoteActor,
+        B: Actor + remote::RemoteActor,
+    {
+        if self.id == sibling_ref.id {
+            return Ok(());
+        }
+
         remote::ActorSwarm::get()
             .ok_or(error::RemoteSendError::SwarmNotBootstrapped)?
             .unlink::<B>(self.id, sibling_ref.id)
@@ -1311,6 +1587,27 @@ impl<M: Send + 'static, Ok: Send + 'static, Err: ReplyError> ReplyRecipient<M, O
         )
     }
 
+    /// Sends a delayed message to the actor without waiting for a reply.
+    ///
+    /// See [`ActorRef::delayed_tell`].
+    #[track_caller]
+    pub fn delayed_tell<F, Fut>(&self, msg: M, delay: Duration, on_result: F) -> DisposableHandle 
+    where
+        F: FnOnce(Result<(), SendError<M>>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let weak_ref = self.downgrade();
+        let join_handle = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let result = match weak_ref.upgrade() {
+                Some(strong_ref) => strong_ref.tell(msg).await,
+                None => Err(SendError::ActorStopped),
+            };
+            on_result(result).await;
+        });
+        DisposableHandle::new(join_handle)
+    }
+
     /// Sends a message to the actor waits for a reply.
     ///
     /// See [`ActorRef::ask`].
@@ -1475,6 +1772,27 @@ impl<M: Send + 'static> Recipient<M> {
             #[cfg(all(debug_assertions, feature = "tracing"))]
             std::panic::Location::caller(),
         )
+    }
+
+    /// Sends a delayed message to the actor without waiting for a reply.
+    ///
+    /// See [`ActorRef::delayed_tell`].
+    #[track_caller]
+    pub fn delayed_tell<F, Fut>(&self, msg: M, delay: Duration, on_result: F) -> DisposableHandle 
+    where
+        F: FnOnce(Result<(), SendError<M>>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let weak_ref = self.downgrade();
+        let join_handle = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let result = match weak_ref.upgrade() {
+                Some(strong_ref) => strong_ref.tell(msg).await,
+                None => Err(SendError::ActorStopped),
+            };
+            on_result(result).await;
+        });
+        DisposableHandle::new(join_handle)
     }
 }
 
@@ -1681,7 +1999,7 @@ where
             std::panic::Location::caller(),
         )
     }
-
+    
     /// Links two remote actors, ensuring they notify each other if either one dies.
     ///
     /// # Example
@@ -1699,7 +2017,7 @@ where
     /// let actor_a = RemoteActorRef::<ActorA>::lookup("actor_a").await?.unwrap();
     /// let actor_b = RemoteActorRef::<ActorB>::lookup("actor_b").await?.unwrap();
     ///
-    /// actor_a.unlink_remote(&actor_b).await?;
+    /// actor_a.link_remote(&actor_b).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// ```
@@ -1725,6 +2043,44 @@ where
         tokio::try_join!(fut_a, fut_b)?;
 
         Ok(())
+    }
+
+    /// This is a one-way link used to monitor remote sibling actors; when a remote sibling actor dies, the current actor will receive a notification. 
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use kameo::actor::RemoteActorRef;
+    /// #
+    /// # #[derive(kameo::Actor, kameo::RemoteActor)]
+    /// # struct ActorA;
+    /// #
+    /// # #[derive(kameo::Actor, kameo::RemoteActor)]
+    /// # struct ActorB;
+    /// #
+    /// # tokio_test::block_on(async {
+    /// let actor_a = RemoteActorRef::<ActorA>::lookup("actor_a").await?.unwrap();
+    /// let actor_b = RemoteActorRef::<ActorB>::lookup("actor_b").await?.unwrap();
+    ///
+    /// actor_a.watch_remote(&actor_b).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// ```
+    pub async fn watch_remote<B>(
+        &self,
+        sibling_ref: &RemoteActorRef<B>,
+    ) -> Result<(), error::RemoteSendError<error::Infallible>>
+    where
+        A: remote::RemoteActor,
+        B: Actor + remote::RemoteActor,
+    {
+        if self.id == sibling_ref.id {
+            return Ok(());
+        }
+
+        remote::ActorSwarm::get()
+            .ok_or(error::RemoteSendError::SwarmNotBootstrapped)?
+            .link::<A, B>(self.id, sibling_ref.id).await
     }
 
     /// Unlinks two previously linked remote actors.
@@ -1770,6 +2126,44 @@ where
         tokio::try_join!(fut_a, fut_b)?;
 
         Ok(())
+    }
+
+    /// Unwatches the remote actor with a previously watched remote actor.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use kameo::actor::RemoteActorRef;
+    /// #
+    /// # #[derive(kameo::Actor, kameo::RemoteActor)]
+    /// # struct ActorA;
+    /// #
+    /// # #[derive(kameo::Actor, kameo::RemoteActor)]
+    /// # struct ActorB;
+    /// #
+    /// # tokio_test::block_on(async {
+    /// let actor_a = RemoteActorRef::<ActorA>::lookup("actor_a").await?.unwrap();
+    /// let actor_b = RemoteActorRef::<ActorB>::lookup("actor_b").await?.unwrap();
+    ///
+    /// actor_a.unwatch_remote(&actor_b).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// ```
+    pub async fn unwatch_remote<B>(
+        &self,
+        sibling_ref: &RemoteActorRef<B>,
+    ) -> Result<(), error::RemoteSendError<error::Infallible>>
+    where
+        A: remote::RemoteActor,
+        B: Actor + remote::RemoteActor,
+    {
+        if self.id == sibling_ref.id {
+            return Ok(());
+        }
+
+        remote::ActorSwarm::get()
+            .ok_or(error::RemoteSendError::SwarmNotBootstrapped)?
+            .unlink::<B>(self.id, sibling_ref.id).await
     }
 
     pub(crate) fn send_to_swarm(&self, msg: remote::SwarmCommand) {

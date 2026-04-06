@@ -1269,6 +1269,8 @@ mod tests {
             );
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+        // enqueue one item to make the mailbox full.
+        let _ = actor_ref.tell(Msg).send().await;
         assert_eq!(
             actor_ref.ask(Msg).try_send().await,
             Err(SendError::MailboxFull(Msg))

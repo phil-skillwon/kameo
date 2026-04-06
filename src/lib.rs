@@ -17,6 +17,7 @@ pub mod remote;
 pub mod reply;
 pub mod request;
 pub mod supervision;
+pub mod disposable;
 
 pub use actor::Actor;
 #[cfg(feature = "macros")]

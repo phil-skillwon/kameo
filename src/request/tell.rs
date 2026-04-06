@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::{WithRequestTimeout, WithoutRequestTimeout};
+use crate::disposable::DisposableHandle;
 
 /// A request to send a message to an actor without any reply.
 ///
@@ -104,6 +105,52 @@ where
             Some(timeout) => Ok(tx.send_timeout(signal, timeout).await?),
             None => Ok(tx.send(signal).await?),
         }
+    }
+
+    /// send the delayed message.
+    pub async fn delayed_send<F, Fut>(self, delay: Duration, on_result: F) -> DisposableHandle 
+    where
+        Tm: Into<Option<Duration>>,
+        F: FnOnce(Result<(), SendError<M>>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let signal = Signal::Message {
+            message: Box::new(self.msg),
+            actor_ref: self.actor_ref.clone(),
+            reply: None,
+            sent_within_actor: self.actor_ref.is_current(),
+            message_name: self.message_name,
+            #[cfg(feature = "tracing")]
+            caller_span: tracing::Span::current(),
+        };
+        let weak_ref = self.actor_ref.downgrade();
+        let duration = self.mailbox_timeout.into();
+        #[cfg(all(debug_assertions, feature = "tracing"))]
+        let call_at: &'static std::panic::Location<'_> = self.called_at;
+        let join_handle = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let ret: Result<(), SendError<M>>;
+            if let Some(actor_ref) = weak_ref.upgrade() {
+                let tx = actor_ref.mailbox_sender();
+                if tx.capacity().is_some() {
+                    #[cfg(all(debug_assertions, feature = "tracing"))]
+                    warn_deadlock(
+                        &actor_ref,
+                        "An actor is sending a `tell` request to itself using a bounded mailbox, which may lead to a deadlock. To avoid this, use `.try_send()`.",
+                        call_at,
+                    );
+                }
+                ret = match duration {
+                    Some(timeout) => tx.send_timeout(signal, timeout).await.map_err(SendError::from),
+                    None => tx.send(signal).await.map_err(SendError::from),
+                };
+            }
+            else {
+                ret = Err(SendError::ActorStopped);
+            }
+            on_result(ret).await;
+        });
+        return DisposableHandle::new(join_handle);
     }
 }
 
@@ -235,6 +282,33 @@ where
             .tell(self.msg, self.mailbox_timeout.into())
             .await
     }
+
+    /// Sends the delayed message.
+    pub async fn delayed_send<F, Fut>(self, delay: Duration, on_result: F) -> DisposableHandle 
+    where
+        Tm: Into<Option<Duration>>,
+        F: FnOnce(Result<(), SendError<M>>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {        
+        let weak_ref = self.actor_ref.downgrade();
+        let msg = self.msg;
+        let maybe_duration = self.mailbox_timeout.into();
+        let join_handle = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let ret: Result<(), SendError<M>>;
+            if let Some(actor_ref) = weak_ref.upgrade() {
+                ret = actor_ref
+                    .handler
+                    .tell(msg, maybe_duration)
+                    .await;
+            }
+            else {
+                ret = Err(SendError::ActorStopped);
+            }
+            on_result(ret).await;
+        });
+        return DisposableHandle::new(join_handle);
+    }
 }
 
 impl<M> RecipientTellRequest<'_, M, WithoutRequestTimeout>
@@ -338,6 +412,33 @@ where
             .handler
             .tell(self.msg, self.mailbox_timeout.into())
             .await
+    }
+
+    /// Sends the delayed message.
+    pub async fn delayed_send<F, Fut>(self, delay: Duration, on_result: F) -> DisposableHandle 
+    where
+        Tm: Into<Option<Duration>>,
+        F: FnOnce(Result<(), SendError<M>>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {        
+        let weak_ref = self.actor_ref.downgrade();
+        let msg = self.msg;
+        let maybe_duration = self.mailbox_timeout.into();
+        let join_handle = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let ret: Result<(), SendError<M>>;
+            if let Some(actor_ref) = weak_ref.upgrade() {
+                ret = actor_ref
+                    .handler
+                    .tell(msg, maybe_duration)
+                    .await;
+            }
+            else {
+                ret = Err(SendError::ActorStopped);
+            }
+            on_result(ret).await;
+        });
+        return DisposableHandle::new(join_handle);
     }
 }
 
@@ -471,9 +572,85 @@ mod remote {
             remote_tell(self.actor_ref, self.msg, self.mailbox_timeout.into(), false)
         }
 
+        /// Sends the delayed message fire-and-forget style (fast, no delivery confirmation).
+        pub async fn delayed_send<F, Fut>(self, delay: Duration, on_result: F) -> super::DisposableHandle 
+        where
+            F: FnOnce(Result<(), RemoteSendError>) -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            let strong_ref = self.actor_ref.clone();
+            let maybe_msg_bytes = rmp_serde::to_vec_named(self.msg).map_err(|err| RemoteSendError::SerializeMessage(err.to_string()));
+	        let maybe_duration = self.mailbox_timeout.into();
+            let join_handle = tokio::spawn(async move {
+                let msg_bytes = match maybe_msg_bytes {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        on_result(Err(err)).await;
+                        return;
+                    }
+                };
+                tokio::time::sleep(delay).await;
+                strong_ref.send_to_swarm(SwarmCommand::Tell {
+                    actor_id: strong_ref.id(),
+                    actor_remote_id: Cow::Borrowed(<A as RemoteActor>::REMOTE_ID),
+                    message_remote_id: Cow::Borrowed(<A as RemoteMessage<M>>::REMOTE_ID),
+                    payload: msg_bytes,
+                    mailbox_timeout: maybe_duration,
+                    immediate: false,
+                    reply: None,
+                });
+                on_result(Ok(())).await;
+            });
+            return super::DisposableHandle::new(join_handle);
+        }
+
         /// Sends the message and waits for delivery acknowledgment (reliable, slower).
         pub async fn send_ack(self) -> Result<(), RemoteSendError> {
             remote_tell_ack(self.actor_ref, self.msg, self.mailbox_timeout.into(), false).await
+        }
+
+        /// Sends the delayed message and waits for delivery acknowledgment (reliable, slower).
+        pub async fn delayed_send_ack<F, Fut>(self, delay: Duration, on_result: F) -> super::DisposableHandle 
+        where
+            F: FnOnce(Result<(), RemoteSendError>) -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            let strong_ref = self.actor_ref.clone();
+            let maybe_msg_bytes = rmp_serde::to_vec_named(self.msg).map_err(|err| RemoteSendError::SerializeMessage(err.to_string()));
+	        let maybe_duration = self.mailbox_timeout.into();
+            let join_handle = tokio::spawn(async move {
+                let msg_bytes = match maybe_msg_bytes {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        on_result(Err(err)).await;
+                        return;
+                    }
+                };
+                tokio::time::sleep(delay).await;
+                let (reply_tx, reply_rx) = oneshot::channel();
+                strong_ref.send_to_swarm(SwarmCommand::Tell {
+                    actor_id: strong_ref.id(),
+                    actor_remote_id: Cow::Borrowed(<A as RemoteActor>::REMOTE_ID),
+                    message_remote_id: Cow::Borrowed(<A as RemoteMessage<M>>::REMOTE_ID),
+                    payload: msg_bytes,
+                    mailbox_timeout: maybe_duration,
+                    immediate: false,
+                    reply: Some(reply_tx),
+                });
+
+                let ret = match reply_rx.await.unwrap() {
+                    messaging::SwarmResponse::Tell(res) => match res {
+                        Ok(()) => Ok(()),
+                        Err(err) => Err(err),
+                    },
+                    messaging::SwarmResponse::OutboundFailure(err) => {
+                        Err(err.map_err(|_| unreachable!("outbound failure doesn't contain handler errors")))
+                    }
+                    _ => panic!("unexpected response"),
+                };
+                on_result(ret).await;
+            });
+            return super::DisposableHandle::new(join_handle);
         }
     }
 
@@ -873,6 +1050,8 @@ mod tests {
             );
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+        // enqueue one item to make the mailbox full.
+        let _ = actor_ref.tell(Sleep(Duration::from_millis(100))).send().await;
         // Finally, this one will fail because there's one item in the mailbox already.
         assert_eq!(
             actor_ref
