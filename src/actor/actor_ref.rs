@@ -102,10 +102,10 @@ where
             .lock()
             .unwrap()
             .insert(name, self.clone());
-        if !was_inserted {
-            Err(error::RegistryError::NameAlreadyRegistered)
-        } else {
+        if was_inserted {
             Ok(())
+        } else {
+            Err(error::RegistryError::NameAlreadyRegistered)
         }
     }
 
@@ -159,6 +159,7 @@ where
     ///
     /// For bidirectional communication that supports `ask` requests,
     /// see [`ActorRef::reply_recipient`].
+    #[must_use]
     pub fn recipient<M>(self) -> Recipient<M>
     where
         A: Message<M>,
@@ -178,6 +179,7 @@ where
     ///
     /// For unidirectional communication that only supports `tell`,
     /// see [`ActorRef::recipient`].
+    #[must_use]
     pub fn reply_recipient<M>(
         self,
     ) -> ReplyRecipient<M, <A::Reply as Reply>::Ok, <A::Reply as Reply>::Error>
@@ -261,6 +263,235 @@ where
     #[inline]
     pub fn kill(&self) {
         self.abort_handle.abort()
+    }
+
+    /// Returns the startup result if the actor has finished starting up, or `None` if startup
+    /// is still in progress.
+    ///
+    /// Unlike [`wait_for_startup_result`](ActorRef::wait_for_startup_result), this method does
+    /// not block — it returns immediately with `None` if the actor has not yet completed its
+    /// [`on_start`](Actor::on_start) hook.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::num::ParseIntError;
+    ///
+    /// use kameo::actor::{Actor, ActorRef, Spawn};
+    ///
+    /// struct MyActor;
+    ///
+    /// impl Actor for MyActor {
+    ///     type Args = Self;
+    ///     type Error = ParseIntError;
+    ///
+    ///     async fn on_start(
+    ///         _state: Self::Args,
+    ///         _actor_ref: ActorRef<Self>,
+    ///     ) -> Result<Self, Self::Error> {
+    ///         "invalid int".parse().map(|_: i32| MyActor) // Will always error
+    ///     }
+    /// }
+    ///
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// actor_ref.wait_for_startup().await;
+    /// match actor_ref.get_startup_result() {
+    ///     Some(Ok(())) => println!("actor started successfully"),
+    ///     Some(Err(err)) => println!("actor failed to start: {err}"),
+    ///     None => println!("actor has not started yet"),
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// ```
+    pub fn get_startup_result(&self) -> Option<Result<(), HookError<A::Error>>>
+    where
+        A::Error: Clone,
+    {
+        match self.startup_result.get()? {
+            Ok(()) => Some(Ok(())),
+            Err(err) => Some(Err(err
+                .with_downcast_ref(|err: &A::Error| HookError::Error(err.clone()))
+                .unwrap_or_else(|| HookError::Panicked(err.clone())))),
+        }
+    }
+
+    /// Calls a closure with the startup result if the actor has finished starting up, or returns
+    /// `None` if startup is still in progress.
+    ///
+    /// Unlike [`wait_for_startup_with_result`](ActorRef::wait_for_startup_with_result), this
+    /// method does not block — it returns immediately with `None` if the actor has not yet
+    /// completed its [`on_start`](Actor::on_start) hook.
+    ///
+    /// The closure receives a reference to the error rather than a clone, which is useful when
+    /// `A::Error` does not implement [`Clone`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use kameo::actor::{Actor, ActorRef, Spawn};
+    ///
+    /// struct MyActor;
+    ///
+    /// #[derive(Debug)]
+    /// struct NonCloneError;
+    ///
+    /// impl Actor for MyActor {
+    ///     type Args = Self;
+    ///     type Error = NonCloneError;
+    ///
+    ///     async fn on_start(
+    ///         _state: Self::Args,
+    ///         _actor_ref: ActorRef<Self>,
+    ///     ) -> Result<Self, Self::Error> {
+    ///         Err(NonCloneError) // Will always error
+    ///     }
+    /// }
+    ///
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// actor_ref.wait_for_startup().await;
+    /// actor_ref.with_startup_result(|res| {
+    ///     assert!(res.is_err());
+    /// });
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// ```
+    pub fn with_startup_result<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(Result<(), HookError<&A::Error>>) -> R,
+    {
+        match self.startup_result.get()? {
+            Ok(()) => Some(f(Ok(()))),
+            Err(err) => match err.err.lock() {
+                Ok(lock) => match lock.downcast_ref() {
+                    Some(err) => Some(f(Err(HookError::Error(err)))),
+                    None => Some(f(Err(HookError::Panicked(err.clone())))),
+                },
+                Err(poison_err) => match poison_err.get_ref().downcast_ref() {
+                    Some(err) => Some(f(Err(HookError::Error(err)))),
+                    None => Some(f(Err(HookError::Panicked(err.clone())))),
+                },
+            },
+        }
+    }
+
+    /// Returns the shutdown result if the actor has finished shutting down, or `None` if the
+    /// actor is still running.
+    ///
+    /// Unlike [`wait_for_shutdown_result`](ActorRef::wait_for_shutdown_result), this method does
+    /// not block — it returns immediately with `None` if the actor has not yet completed its
+    /// [`on_stop`](Actor::on_stop) hook.
+    ///
+    /// Note: This method does not initiate the stop process. Use
+    /// [`stop_gracefully`](ActorRef::stop_gracefully) or [`kill`](ActorRef::kill) to signal
+    /// the actor to stop first.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use kameo::actor::{Actor, ActorRef, Spawn, WeakActorRef};
+    /// use kameo::error::{ActorStopReason, Infallible};
+    ///
+    /// struct MyActor;
+    ///
+    /// impl Actor for MyActor {
+    ///     type Args = Self;
+    ///     type Error = Infallible;
+    ///
+    ///     async fn on_start(
+    ///         state: Self::Args,
+    ///         _actor_ref: ActorRef<Self>,
+    ///     ) -> Result<Self, Self::Error> {
+    ///         Ok(state)
+    ///     }
+    /// }
+    ///
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// actor_ref.stop_gracefully().await.unwrap();
+    /// actor_ref.wait_for_shutdown().await;
+    /// match actor_ref.get_shutdown_result() {
+    ///     Some(Ok(reason)) => println!("actor stopped: {reason:?}"),
+    ///     Some(Err(err)) => println!("actor stopped with error: {err}"),
+    ///     None => println!("actor has not stopped yet"),
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// ```
+    pub fn get_shutdown_result(&self) -> Option<Result<ActorStopReason, HookError<A::Error>>>
+    where
+        A::Error: Clone,
+    {
+        match self.shutdown_result.get()? {
+            Ok(reason) => Some(Ok(reason.clone())),
+            Err(err) => Some(Err(err
+                .with_downcast_ref(|err: &A::Error| HookError::Error(err.clone()))
+                .unwrap_or_else(|| HookError::Panicked(err.clone())))),
+        }
+    }
+
+    /// Calls a closure with the shutdown result if the actor has finished shutting down, or
+    /// returns `None` if the actor is still running.
+    ///
+    /// Unlike [`wait_for_shutdown_with_result`](ActorRef::wait_for_shutdown_with_result), this
+    /// method does not block — it returns immediately with `None` if the actor has not yet
+    /// completed its [`on_stop`](Actor::on_stop) hook.
+    ///
+    /// The closure receives a reference to the error rather than a clone, which is useful when
+    /// `A::Error` does not implement [`Clone`].
+    ///
+    /// Note: This method does not initiate the stop process. Use
+    /// [`stop_gracefully`](ActorRef::stop_gracefully) or [`kill`](ActorRef::kill) to signal
+    /// the actor to stop first.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use kameo::actor::{Actor, ActorRef, Spawn, WeakActorRef};
+    /// use kameo::error::{ActorStopReason, Infallible};
+    ///
+    /// struct MyActor;
+    ///
+    /// impl Actor for MyActor {
+    ///     type Args = Self;
+    ///     type Error = Infallible;
+    ///
+    ///     async fn on_start(
+    ///         state: Self::Args,
+    ///         _actor_ref: ActorRef<Self>,
+    ///     ) -> Result<Self, Self::Error> {
+    ///         Ok(state)
+    ///     }
+    /// }
+    ///
+    /// # tokio_test::block_on(async {
+    /// let actor_ref = MyActor::spawn(MyActor);
+    /// actor_ref.stop_gracefully().await.unwrap();
+    /// actor_ref.wait_for_shutdown().await;
+    /// actor_ref.with_shutdown_result(|res| {
+    ///     assert!(res.is_ok());
+    /// });
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// ```
+    pub fn with_shutdown_result<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(Result<&ActorStopReason, HookError<&A::Error>>) -> R,
+    {
+        match self.shutdown_result.get()? {
+            Ok(reason) => Some(f(Ok(reason))),
+            Err(err) => match err.err.lock() {
+                Ok(lock) => match lock.downcast_ref() {
+                    Some(err) => Some(f(Err(HookError::Error(err)))),
+                    None => Some(f(Err(HookError::Panicked(err.clone())))),
+                },
+                Err(poison_err) => match poison_err.get_ref().downcast_ref() {
+                    Some(err) => Some(f(Err(HookError::Error(err)))),
+                    None => Some(f(Err(HookError::Panicked(err.clone())))),
+                },
+            },
+        }
     }
 
     /// Waits for the actor to finish startup and become ready to process messages.
@@ -1494,6 +1725,7 @@ impl<M: Send + 'static, Ok: Send + 'static, Err: ReplyError> ReplyRecipient<M, O
     /// Returns a [`Recipient<M>`] that only supports `tell` operations. This is useful
     /// when you need to pass the recipient to code that doesn't require bidirectional
     /// communication.
+    #[must_use]
     pub fn erase_reply(self) -> Recipient<M> {
         Recipient {
             handler: self.handler.upcast(),
@@ -2334,6 +2566,7 @@ impl<A: Actor> WeakActorRef<A> {
 
     /// Tries to convert a `WeakActorRef` into a [`ActorRef`]. This will return `Some`
     /// if there are other `ActorRef` instances alive, otherwise `None` is returned.
+    #[must_use]
     pub fn upgrade(&self) -> Option<ActorRef<A>> {
         self.mailbox_sender.upgrade().map(|mailbox| ActorRef {
             id: self.id,
@@ -2419,6 +2652,45 @@ impl<A: Actor> WeakActorRef<A> {
         }
     }
 
+    /// Returns the startup result if the actor has finished starting up, or `None` if startup
+    /// is still in progress.
+    ///
+    /// See [`ActorRef::get_startup_result`] for full details and examples.
+    pub fn get_startup_result(&self) -> Option<Result<(), HookError<A::Error>>>
+    where
+        A::Error: Clone,
+    {
+        match self.startup_result.get()? {
+            Ok(()) => Some(Ok(())),
+            Err(err) => Some(Err(err
+                .with_downcast_ref(|err: &A::Error| HookError::Error(err.clone()))
+                .unwrap_or_else(|| HookError::Panicked(err.clone())))),
+        }
+    }
+
+    /// Calls a closure with the startup result if the actor has finished starting up, or returns
+    /// `None` if startup is still in progress.
+    ///
+    /// See [`ActorRef::with_startup_result`] for full details and examples.
+    pub fn with_startup_result<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(Result<(), HookError<&A::Error>>) -> R,
+    {
+        match self.startup_result.get()? {
+            Ok(()) => Some(f(Ok(()))),
+            Err(err) => match err.err.lock() {
+                Ok(lock) => match lock.downcast_ref() {
+                    Some(err) => Some(f(Err(HookError::Error(err)))),
+                    None => Some(f(Err(HookError::Panicked(err.clone())))),
+                },
+                Err(poison_err) => match poison_err.get_ref().downcast_ref() {
+                    Some(err) => Some(f(Err(HookError::Error(err)))),
+                    None => Some(f(Err(HookError::Panicked(err.clone())))),
+                },
+            },
+        }
+    }
+
     /// Waits for the actor to finish processing and stop running.
     ///
     /// See [`ActorRef::wait_for_shutdown`] for full details and examples.
@@ -2459,6 +2731,45 @@ impl<A: Actor> WeakActorRef<A> {
                 Err(poison_err) => match poison_err.get_ref().downcast_ref() {
                     Some(err) => f(Err(HookError::Error(err))),
                     None => f(Err(HookError::Panicked(err.clone()))),
+                },
+            },
+        }
+    }
+
+    /// Returns the shutdown result if the actor has finished shutting down, or `None` if the
+    /// actor is still running.
+    ///
+    /// See [`ActorRef::get_shutdown_result`] for full details and examples.
+    pub fn get_shutdown_result(&self) -> Option<Result<ActorStopReason, HookError<A::Error>>>
+    where
+        A::Error: Clone,
+    {
+        match self.shutdown_result.get()? {
+            Ok(reason) => Some(Ok(reason.clone())),
+            Err(err) => Some(Err(err
+                .with_downcast_ref(|err: &A::Error| HookError::Error(err.clone()))
+                .unwrap_or_else(|| HookError::Panicked(err.clone())))),
+        }
+    }
+
+    /// Calls a closure with the shutdown result if the actor has finished shutting down, or
+    /// returns `None` if the actor is still running.
+    ///
+    /// See [`ActorRef::with_shutdown_result`] for full details and examples.
+    pub fn with_shutdown_result<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(Result<&ActorStopReason, HookError<&A::Error>>) -> R,
+    {
+        match self.shutdown_result.get()? {
+            Ok(reason) => Some(f(Ok(reason))),
+            Err(err) => match err.err.lock() {
+                Ok(lock) => match lock.downcast_ref() {
+                    Some(err) => Some(f(Err(HookError::Error(err)))),
+                    None => Some(f(Err(HookError::Panicked(err.clone())))),
+                },
+                Err(poison_err) => match poison_err.get_ref().downcast_ref() {
+                    Some(err) => Some(f(Err(HookError::Error(err)))),
+                    None => Some(f(Err(HookError::Panicked(err.clone())))),
                 },
             },
         }
@@ -2632,6 +2943,7 @@ impl<M: Send + 'static> WeakRecipient<M> {
 
     /// Tries to convert a `WeakRecipient` into a [`Recipient`]. This will return `Some`
     /// if there are other `ActorRef`/`Recipient` instances alive, otherwise `None` is returned.
+    #[must_use]
     pub fn upgrade(&self) -> Option<Recipient<M>> {
         self.handler.upgrade()
     }
@@ -2712,6 +3024,7 @@ impl<M: Send + 'static, Ok: Send + 'static, Err: ReplyError> WeakReplyRecipient<
 
     /// Tries to convert a `WeakReplyRecipient` into a [`ReplyRecipient`]. This will return `Some`
     /// if there are other `ActorRef`/`ReplyRecipient` instances alive, otherwise `None` is returned.
+    #[must_use]
     pub fn upgrade(&self) -> Option<ReplyRecipient<M, Ok, Err>> {
         self.handler.reply_upgrade()
     }
